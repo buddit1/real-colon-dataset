@@ -73,10 +73,6 @@ def download_file(args):
     simple_filename = local_filename
     existing_file_size = file_exists(local_filename)
 
-    # Check if file already exists
-    if existing_file_size != -1:
-        print(f'{simple_filename} already exists.')
-
     max_attempts = 1000  # Maximum number of download attempts
     attempt = 0
     retry_delay = 180  # Wait for 3 minutes (180 seconds) before retrying
@@ -92,18 +88,12 @@ def download_file(args):
 
                 # Download the file from figshare and record the size and time it took
                 with open(local_filename, 'wb') as f:
-                    print(f'Downloading {simple_filename}... {total_size / (1024 * 1024):.2f} MB')
                     for chunk in r.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
                             downloaded_size += len(chunk)
                     elapsed_time = time.time() - start_time
                     minutes, seconds = divmod(int(elapsed_time), 60)
-                    print(
-                        f'Downloaded {simple_filename}...'
-                        f' {downloaded_size / (1024 * 1024):.2f} '
-                        f'MB/{total_size / (1024 * 1024):.2f} MB downloaded in '
-                        f'{minutes}m {seconds}s', end='\r')
                 print()  # Print a newline after download completion
             return local_filename
 
@@ -187,9 +177,10 @@ def download_to_blob(file_url, file_name, storage_acct_url: str,
             extract_minutes = extract_time // 60
             extract_seconds = extract_time % 60
             logger.info(f"extracting file {file_name} took {extract_minutes} minutes and {extract_seconds:.2f} seconds")
+            os.remove(local_file_path)
             upload_start = time.time()
             for root, dirs, files in os.walk(tmpdir):
-                for f in tqdm.tqdm(files):
+                for f in files:
                     full_path = os.path.join(root, f)
                     rel_path = os.path.relpath(full_path, tmpdir)
                     blob_path = os.path.join(base_blob_name, rel_path)
@@ -202,7 +193,7 @@ def download_to_blob(file_url, file_name, storage_acct_url: str,
             logger.info(f"uploading blobs for {file_name} took {upload_minutes} minutes and {upload_seconds:.2f} seconds")
         total_time = time.time() - start
         total_minutes = total_time // 60
-        total_seconds = total_time & 60
+        total_seconds = total_time % 60
         logger.info(f"total time for {file_name} was {total_minutes} minutes and {total_seconds:.2f} seconds")
     except Exception as e:
         logger.exception(e)
@@ -231,7 +222,6 @@ def main():
     article_data = response.json()
 
     download_tasks = []
-
     for file_info in article_data['files']:
 
         # Get the file names
@@ -253,7 +243,7 @@ def main():
     # Create a pool of worker processes and download files concurrently
     if num_processes != 0:
         with Pool(processes=num_processes) as pool:
-            results = pool.starmap(download_to_blob, download_tasks)
+            results = pool.starmap(download_to_blob, tqdm.tqdm(download_tasks, total=len(download_tasks)))
 
     fnames = [args[1] for args in download_tasks]
     for file, n_blobs in zip(fnames, results):
