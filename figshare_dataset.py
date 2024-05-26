@@ -13,6 +13,14 @@ import requests
 import tarfile
 import time
 from multiprocessing import Pool
+import tempfile
+import logging
+
+import dotenv
+import tqdm
+from azure.identity import DefaultAzureCredential
+from azure.storage.blob import BlobServiceClient, ContainerClient
+
 
 # Define Figshare article URL and API endpoint
 article_url = 'https://api.figshare.com/v2/articles/22202866'
@@ -21,7 +29,25 @@ article_url = 'https://api.figshare.com/v2/articles/22202866'
 custom_ca_bundle = None
 
 # Specify the path where to download the dataset
-DOWNLOAD_DIR = "./dataset/"
+CONTAINER_NAME = "polyp-datasets"
+BASE_BLOB_NAME = "real-colon-dataset"
+
+
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+file_handler = logging.FileHandler('download_real_colon_dataset.log')
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(formatter)
+
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.DEBUG)
+console_handler.setFormatter(formatter)
+
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
 
 
 # Helper function to return the file size if a path exists, -1 otherwise
@@ -29,6 +55,17 @@ def file_exists(local_filename):
     if os.path.exists(local_filename):
         return os.path.getsize(local_filename)
     return -1
+
+
+def blob_exists(local_filename, container_client: ContainerClient, base_blob_name):
+    name_wo_ext = local_filename[:local_filename.find('.')]
+    blob_path = os.path.join(base_blob_name, name_wo_ext)
+    blobs_list = container_client.list_blob_names(name_starts_with=blob_path)
+    blob_exists = False
+    for blob in blobs_list:
+        blob_exists = True
+        break
+    return blob_exists
 
 
 def download_file(args):
@@ -118,41 +155,94 @@ def extract_files(file_paths, download_dir):
     pool.map(extract_file, [(file_path, download_dir) for file_path in file_paths])
 
 
+def download_to_blob(file_url, file_name, storage_acct_url: str,
+                     container_name: str, base_blob_name: str):
+    #have to initialize blob service stuff in here to play nice with multiprocessing
+    credential = DefaultAzureCredential()
+    blob_service_client = BlobServiceClient(storage_acct_url, credential=credential)
+    container_exists = False
+    containers = blob_service_client.list_containers(name_starts_with=container_name)
+    for container in containers:
+        if container.name == container_name:
+            container_exists = True
+            break
+    if not container_exists:
+        container_client = blob_service_client.create_container(container_name)
+    else:
+        container_client = blob_service_client.get_container_client(container_name)
+    n_blobs_uploaded = 0
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            start = time.time()
+            local_file_path = os.path.join(tmpdir, file_name)
+            download_file((file_url, local_file_path))
+            downloaded_time = time.time() - start
+            download_minutes = downloaded_time // 60
+            download_seconds = downloaded_time % 60
+            logger.info(f"downloading file {file_name} took {download_minutes} minutes and {download_seconds:.2f} seconds")
+            extract_start = time.time()
+            with tarfile.open(local_file_path, 'r') as tar_ref:
+                    tar_ref.extractall(tmpdir)
+            extract_time = time.time() - extract_start
+            extract_minutes = extract_time // 60
+            extract_seconds = extract_time % 60
+            logger.info(f"extracting file {file_name} took {extract_minutes} minutes and {extract_seconds:.2f} seconds")
+            upload_start = time.time()
+            for root, dirs, files in os.walk(tmpdir):
+                for f in tqdm.tqdm(files):
+                    full_path = os.path.join(root, f)
+                    rel_path = os.path.relpath(full_path, tmpdir)
+                    blob_path = os.path.join(base_blob_name, rel_path)
+                    with open(full_path, 'rb') as data:
+                        container_client.upload_blob(name=blob_path, data=data)
+                        n_blobs_uploaded += 1
+            upload_time = time.time() - upload_start
+            upload_minutes = upload_time // 60
+            upload_seconds = upload_time % 60
+            logger.info(f"uploading blobs for {file_name} took {upload_minutes} minutes and {upload_seconds:.2f} seconds")
+        total_time = time.time() - start
+        total_minutes = total_time // 60
+        total_seconds = total_time & 60
+        logger.info(f"total time for {file_name} was {total_minutes} minutes and {total_seconds:.2f} seconds")
+    except Exception as e:
+        logger.exception(e)
+        return -1
+    return n_blobs_uploaded
+
 def main():
+    dotenv.load_dotenv()
+    account_url = os.getenv("AZURE_STORAGE_ACCOUNT_URL")
+    default_credential = DefaultAzureCredential()
+    blob_service_client = BlobServiceClient(account_url, credential=default_credential)
+
+    container_exists = False
+    containers = blob_service_client.list_containers(name_starts_with=CONTAINER_NAME)
+    for container in containers:
+        if container.name == CONTAINER_NAME:
+            container_exists = True
+            break
+    if not container_exists:
+        container_client = blob_service_client.create_container(CONTAINER_NAME)
+    else:
+        container_client = blob_service_client.get_container_client(CONTAINER_NAME)
+    
     response = requests.get(article_url, verify=custom_ca_bundle or True)
     response.raise_for_status()
     article_data = response.json()
 
-    # Change the download_dir to the directory you want the downloads in
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-    download_tasks = []  # Store download tasks as tuples (url, local_file_path)
+    download_tasks = []
 
     for file_info in article_data['files']:
 
         # Get the file names
         file_url = file_info['download_url']
         file_name = file_info['name']
-        local_file_path = os.path.join(DOWNLOAD_DIR, file_name)
-        local_dir_check = local_file_path.rstrip('.tar.gz')
-
-        # Check if either the directory or the zipped file already exists
-        existing_file_size = file_exists(local_file_path)
-        existing_file_path = file_exists(local_dir_check)
-        if existing_file_path != -1:
-            print(f'{local_dir_check} already exists. Skipping download.')
+        existing_blob = blob_exists(file_name, container_client, BASE_BLOB_NAME)
+        if existing_blob:
+            logger.info(f"blobs for file {file_name} already uploaded. Skipping")
             continue
-        if existing_file_size != -1:
-            remote_file_size = int(file_info['size'])
-            if existing_file_size == remote_file_size:
-                print(f'{file_name} already exists. Skipping download.')
-                continue
-            else:
-                print(f'{file_name} already exists but has a different size. Deleting it...')
-                os.remove(local_file_path)
-
-        download_tasks.append((file_url, local_file_path))
-        print(f'Queued {file_name} for download...')
+        download_tasks.append((file_url, file_name, account_url, CONTAINER_NAME, BASE_BLOB_NAME))
+        logger.info(f'Queued {file_name} for download...')
 
     # Control the number of processes by adjusting this variable
     num_processes = 4  # Change this to the desired number of processes
@@ -162,14 +252,16 @@ def main():
 
     # Create a pool of worker processes and download files concurrently
     if num_processes != 0:
-        pool = Pool(processes=num_processes)
-        downloaded_files = pool.map(download_file, download_tasks)
+        with Pool(processes=num_processes) as pool:
+            results = pool.starmap(download_to_blob, download_tasks)
 
-    # Now that all downloads are complete, extract the files
-    tar_files = [file for file in os.listdir(DOWNLOAD_DIR) if file.endswith('.tar.gz')]
-    extract_files(tar_files, DOWNLOAD_DIR)
-
-    print('Process completed.')
+    fnames = [args[1] for args in download_tasks]
+    for file, n_blobs in zip(fnames, results):
+        if n_blobs == -1:
+            logger.error(f"Something went wrong for file {file}. See exception logs for stack trace.")
+        else:
+            logger.info(f"Uploaded {n_blobs} for file {file}")
+    logger.info('All downloads completed.')
 
 
 if __name__ == "__main__":
