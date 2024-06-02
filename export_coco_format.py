@@ -10,7 +10,9 @@
 import os
 import json
 import random
+import shutil
 import xml.etree.ElementTree as ET
+import tqdm
 
 
 def parsevocfile(annotation_file):
@@ -184,7 +186,7 @@ def convert_video_list(base_dataset_folder, video_list, annotation_list, frames_
         xml_to_be_used = [all_xmls[y] for y in selected_frames]
 
         # Process each selected frame for current video
-        for c_xml in xml_to_be_used:
+        for c_xml in tqdm.tqdm(xml_to_be_used):
             c_data = parsevocfile(os.path.join(base_dataset_folder, curr_ann_folder, c_xml))
             
             # Add the image to the list of images
@@ -207,10 +209,12 @@ def convert_video_list(base_dataset_folder, video_list, annotation_list, frames_
                 image_uniq_box_cnt += 1
 
             # Create symbolic link from the original dataset location
-            os.symlink(
-                os.path.relpath(os.path.join(base_dataset_folder, curr_video_folder,c_data['img_name']),frames_output_folder),
-                os.path.join(frames_output_folder, c_data['img_name']))
+            # os.symlink(
+            #     os.path.relpath(os.path.join(base_dataset_folder, curr_video_folder,c_data['img_name']),frames_output_folder),
+            #     os.path.join(frames_output_folder, c_data['img_name']))
             # Image process completed, increment id
+            shutil.copy(os.path.join(base_dataset_folder, curr_video_folder,c_data['img_name']),
+                        os.path.join(frames_output_folder, c_data['img_name']))
             image_uniq_id_cnt += 1
     print(f"Processing completed with {image_uniq_id_cnt} images and {image_uniq_box_cnt} boxes")
     with open(json_output_file, 'w') as off:
